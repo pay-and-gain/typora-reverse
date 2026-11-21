@@ -6,6 +6,8 @@
 
 **作者**：[pay-and-gain](https://github.com/pay-and-gain)　·　**项目地址**：[github.com/pay-and-gain/typora-reverse](https://github.com/pay-and-gain/typora-reverse)
 
+**目录**：[一句话结论](#一句话结论) · [成品](#成品) · [界面效果](#界面效果) · [文件说明](#文件说明) · [自行构建](#自行构建) · [实现要点](#实现要点) · [已知限制](#已知限制) · [免责声明](#免责声明) · [支持](#支持)
+
 ---
 
 ## 一句话结论
@@ -18,16 +20,30 @@ Releases 里的 `Typora-1.13.7-portable.zip` 是开箱即用的便携包：解�
 
 它内置的是**运行时签名**：每次启动读取本机 `MachineGuid`、算出指纹、当场签一份授权提交。所以换电脑也能直接用，无需重新配置。
 
-## 目录
+## 界面效果
 
-```
-docs/REVERSE_HANDBOOK.md   完整逆向手册（偏移、常量、时序、排错表）
-docs/AI-TASK.md            可直接整份交给 AI 独立执行的分阶段任务书
-tools/patch_asar.js        改写 app.asar（换公钥 + 绕过自检 + 自动注入），单机手工激活
-tools/gen_license.js       生成单机激活码（含公钥一致性检查与回环验证）
-tools/pack_dist.js         生成「运行时签名」版，产出可分发包（任意机器自动激活）
-tools/probes/              侦查脚本：asar 布局解析、bundle 切片、二进制字符串提取
-```
+随包附带三套深色主题，主色分别为朱红、冷蓝、青灰，共用同一套排版，切换只改颜色。
+
+**朱红（默认）**
+
+![朱红主题](docs/images/theme-warm.png)
+
+**冷蓝**
+
+![冷蓝主题](docs/images/theme-cool.png)
+
+## 文件说明
+
+| 文件 | 用途 |
+|---|---|
+| `docs/REVERSE_HANDBOOK.md` | 完整逆向手册：偏移、常量、时序、排错对照表 |
+| `docs/AI-TASK.md` | 可直接整份交给 AI 独立执行的分阶段任务书 |
+| `tools/patch_asar.js` | 改写 `app.asar`，单机手工激活（换公钥 + 绕过自检） |
+| `tools/gen_license.js` | 生成单机激活码，含公钥一致性检查与回环验证 |
+| `tools/pack_dist.js` | 产出可分发包，任意机器启动自动激活（内嵌私钥） |
+| `tools/probes/probe_layout.js` | 解析 asar 文件表、反推数据区起点、校验槽位 |
+| `tools/probes/probe_bundle.js` | 从单行 minified bundle 中按关键词切出上下文 |
+| `tools/probes/probe_strings.js` | 从 `.jsc` 字节码常量池中提取可打印字符串 |
 
 ## 自行构建
 

@@ -1,0 +1,9 @@
+﻿# 统一换行，消除 CRLF 警告
+* text=auto eol=lf
+
+# 二进制不做换行转换
+*.png binary
+*.zip binary
+*.asar binary
+*.jsc binary
+*.ttf binary
