@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 "use strict";
 /**
- * 改写 Typora app.asar 内的 launch.dist.js（换公钥 + 绕过完整性自检 + 运行时自动激活）。
+ * 改写 Typora app.asar 内的 launch.dist.js（换公钥 + 绕过完整性自检 + 自动激活）。
  *
- * 用法: node tools/patch_asar.js <样本根目录>
+ * 用法: node tools/patch_asar.js <样本根目录> [--repack]
  * 根目录下需有: Typora/resources/app.asar, private.pem, public.pem
+ *
+ * 两种写入策略，自动选择：
+ *   1. 槽位够大 → 原地覆盖（保守，不动其他文件）
+ *   2. 槽位不够 → 整个 asar 解包后重打包（原厂 asar 的 launch.dist.js 只有 1383 字节，
+ *      装不下 hook，必须走这条）
  *
  * 原理见 docs/REVERSE_HANDBOOK.md
  */
@@ -14,7 +19,7 @@ const path = require("path");
 
 const ROOT = process.argv[2];
 if (!ROOT) {
-  console.error("用法: node tools/patch_asar.js <样本根目录>");
+  console.error("用法: node tools/patch_asar.js <样本根目录> [--repack]");
   process.exit(1);
 }
 
@@ -22,26 +27,69 @@ const ASAR = path.join(ROOT, "Typora", "resources", "app.asar");
 const PRIV = fs.readFileSync(path.join(ROOT, "private.pem"), "utf8").trim();
 const PUB = fs.readFileSync(path.join(ROOT, "public.pem"), "utf8").trim();
 
-// fn_0212 不透明完整性校验的两个常量（本样本实测值）
 const INTEG_EXPECTED =
   "pvyXdYxWo0HsOVIEo4RFsMiWAmuDpJZ4TZeO0g9ecBchHm86UjJZZftJ2QWkuqlFKPWNbI8lkusRKlRT9SPun07e9mhQ1lZeiojs";
 const INTEG_HEAD = [168, 163, 144, 221, 123, 254, 219, 133, 103, 114, 95, 163, 156, 84, 26, 17];
 
-/** 从 asar 里按条目名取出文件内容（不依赖外部解包工具） */
-function readEntry(buf, name) {
-  const head = buf.subarray(0, 8192).toString("latin1");
-  let sum = 0;
-  for (const m of head.matchAll(/"size":(\d+)/g)) sum += Number(m[1]);
-  const dataStart = buf.length - sum;
-  const re = new RegExp(
-    '"' + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '":\\{"size":(\\d+),"offset":"?(\\d+)"?'
-  );
-  const m = head.match(re);
-  if (!m) throw new Error("asar 内未找到条目: " + name);
-  const size = Number(m[1]);
-  const off = dataStart + Number(m[2]);
-  return { data: buf.subarray(off, off + size), size, off };
+/* ---------------- asar 读写 ---------------- */
+
+/** 头部结构: [4][outerLen][headerLen][jsonLen][json][padding] */
+function unpack(buf) {
+  const jsonLen = buf.readUInt32LE(12);
+  const pad = (4 - (jsonLen % 4)) % 4;
+  const dataStart = 16 + jsonLen + pad;
+  const header = JSON.parse(buf.subarray(16, 16 + jsonLen).toString("utf8"));
+
+  const files = new Map();
+  (function walk(node, prefix) {
+    for (const [name, meta] of Object.entries(node.files || {})) {
+      const p = prefix ? prefix + "/" + name : name;
+      if (meta.files) {
+        walk(meta, p);
+      } else {
+        const start = dataStart + Number(meta.offset);
+        files.set(p, {
+          data: Buffer.from(buf.subarray(start, start + meta.size)),
+          integrity: meta.integrity,
+        });
+      }
+    }
+  })(header, "");
+
+  return { files, dataStart, total: buf.length };
 }
+
+function pack(files) {
+  let offset = 0;
+  const headerFiles = {};
+  const chunks = [];
+  for (const [name, f] of files) {
+    const entry = { size: f.data.length, offset: String(offset) };
+    if (f.integrity) entry.integrity = f.integrity;
+    headerFiles[name] = entry;
+    chunks.push(f.data);
+    offset += f.data.length;
+  }
+
+  const jsonBuf = Buffer.from(JSON.stringify({ files: headerFiles }), "utf8");
+  const pad = (4 - (jsonBuf.length % 4)) % 4;
+
+  const headerBuf = Buffer.alloc(4 + jsonBuf.length + pad);
+  headerBuf.writeUInt32LE(jsonBuf.length, 0);
+  jsonBuf.copy(headerBuf, 4);
+
+  const outer = Buffer.alloc(4 + headerBuf.length);
+  outer.writeUInt32LE(headerBuf.length, 0);
+  headerBuf.copy(outer, 4);
+
+  const sizeBuf = Buffer.alloc(8);
+  sizeBuf.writeUInt32LE(4, 0);
+  sizeBuf.writeUInt32LE(outer.length, 4);
+
+  return Buffer.concat([sizeBuf, outer, ...chunks]);
+}
+
+/* ---------------- hook ---------------- */
 
 const HOOK = `
 (function(){
@@ -99,35 +147,75 @@ try{Promise.resolve(OFF(ev,tok)).then(function(r){L("activate "+tag+" ->",JSON.s
 })();
 `;
 
-// ---- 主流程 ----
+/* ---------------- 主流程 ---------------- */
+
 const buf0 = fs.readFileSync(ASAR);
+const { files } = unpack(buf0);
 
-const bak = readEntry(buf0, "launch.dist.bak.js");
-const ld = readEntry(buf0, "launch.dist.js");
-console.log("launch.dist.bak.js:", bak.size, "@", bak.off);
-console.log("launch.dist.js    :", ld.size, "@", ld.off);
-
-const bakText = bak.data.toString("utf8");
+// 原始 loader：改过的包里有独立备份，原厂包里 launch.dist.js 本身就是原始 loader
 const ANCHOR = 'v8.setFlagsFromString("--no-lazy")';
-if (!bakText.includes(ANCHOR)) throw new Error("原始 loader 中未找到锚点");
+let loaderName = null;
+for (const [name, f] of files) {
+  if (!/launch\.dist\.(bak\.js|js)$/.test(name)) continue;
+  if (f.data.toString("utf8").includes(ANCHOR)) {
+    loaderName = name;
+    break;
+  }
+}
+if (!loaderName) throw new Error("asar 内未找到含 v8 flags 的原始 loader");
+const loaderText = files.get(loaderName).data.toString("utf8");
+console.log("loader 来源:", loaderName, "(" + loaderText.length + " bytes)");
 
-const newText = bakText.replace(ANCHOR, HOOK.trim() + ";" + ANCHOR);
+const newText = loaderText.replace(ANCHOR, HOOK.trim() + ";" + ANCHOR);
 const bytes = Buffer.from(newText, "utf8");
-console.log("new launch.dist.js:", bytes.length, "/", ld.size);
-if (bytes.length > ld.size) throw new Error("超出槽位，需重打包 asar（本脚本不支持）");
-
 new vm.Script(newText);
-console.log("syntax: PASS");
+console.log("新 launch.dist.js:", bytes.length, "bytes, syntax PASS");
 
-const buf = Buffer.from(buf0);
-const padded = Buffer.alloc(ld.size, 0x0a);
-bytes.copy(padded, 0);
-padded.copy(buf, ld.off);
+const current = files.get("launch.dist.js");
+if (!current) throw new Error("asar 内没有 launch.dist.js");
+const slot = current.data.length;
+console.log("原槽位:", slot, "bytes");
+
+const forceRepack = process.argv.includes("--repack");
+const useRepack = forceRepack || bytes.length > slot;
+console.log("写入策略:", useRepack ? "重打包整个 asar" : "原地覆盖槽位");
+
+// 原始 loader 需要作为备份留在包内（hook 靠它绕过自检）
+if (!files.has("launch.dist.bak.js")) {
+  files.set("launch.dist.bak.js", { data: Buffer.from(loaderText, "utf8") });
+  console.log("补充 launch.dist.bak.js（原始 loader 备份）");
+}
+
+// 内容变了，旧的 integrity 哈希必然失配；去掉该字段让 Electron 跳过校验
+files.set("launch.dist.js", { data: bytes });
 
 const backup = ASAR + ".orig";
 if (!fs.existsSync(backup)) fs.copyFileSync(ASAR, backup);
-fs.writeFileSync(ASAR, buf);
 
-const check = fs.readFileSync(ASAR).subarray(ld.off, ld.off + ld.size).toString("utf8");
-console.log("written:", check.includes('require("./atom.compiled.dist.jsc")') ? "PASS" : "FAIL");
-console.log("backup :", backup);
+let out;
+if (useRepack) {
+  out = pack(files);
+} else {
+  out = Buffer.from(buf0);
+  // 原地覆盖时需要按原 offset 定位
+  const jsonLen = buf0.readUInt32LE(12);
+  const pad = (4 - (jsonLen % 4)) % 4;
+  const dataStart = 16 + jsonLen + pad;
+  const json = JSON.parse(buf0.subarray(16, 16 + jsonLen).toString("utf8"));
+  const off = dataStart + Number(json.files["launch.dist.js"].offset);
+  const padded = Buffer.alloc(slot, 0x0a);
+  bytes.copy(padded, 0);
+  padded.copy(out, off);
+}
+
+fs.writeFileSync(ASAR, out);
+
+// 自检：重新解包，确认结构与内容
+const verify = unpack(fs.readFileSync(ASAR));
+const ld = verify.files.get("launch.dist.js");
+const okMain = ld && ld.data.toString("utf8").includes('require("./atom.compiled.dist.jsc")');
+const okBak = verify.files.has("launch.dist.bak.js");
+const jsc = verify.files.get("atom.compiled.dist.jsc");
+console.log("自检 文件数:", verify.files.size, "| loader 尾部:", okMain, "| bak 存在:", okBak, "| jsc 完整:", !!jsc && jsc.data.length === 379912);
+console.log("asar 大小:", out.length, "原:", buf0.length);
+console.log("备份:", backup);

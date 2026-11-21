@@ -68,7 +68,7 @@ node tools/gen_license.js <样本根目录>
 
 1. **换公钥**：包装 `crypto.publicDecrypt`，把 key 参数替换为自己的 PEM，解不开时回退原公钥。
 2. **绕过完整性自检**：客户端会 SHA256 校验 `launch.dist.js` 自身，并解密一段硬编码密文比对明文。前者用 `fs.readFileSync` 重定向返回原始备份内容，后者在 `publicDecrypt` 与 `Buffer.prototype.equals` 两处短路。
-3. **原地改写**：`launch.dist.js` 在 asar 内有固定槽位（本样本 16220 字节），新代码不超过槽位即可直接覆盖，不需要重打包整个 asar。原 loader 尾部从 `launch.dist.bak.js` 原样拼接，保证 `.jsc` 字节码加载逻辑逐字节不变。
+3. **两种写入策略**：槽位够大时原地覆盖，不动其他文件，最稳；槽位不足时——**原厂 asar 的 `launch.dist.js` 只有 1383 字节，必然不足**——自动解包整个 asar、替换文件、重算 header 与全部偏移后重新打包。原 loader 尾部原样拼接，保证 `.jsc` 字节码加载逻辑逐字节不变。实测从原厂 382346 字节重打包为 390253 字节，启动与自动激活均正常。
 4. **应对续期**：客户端每次启动会向 `typoraio.cn/store` 提交续期请求，服务器拒绝后就清空本地授权。这是服务端行为，无法从客户端根除，只能在其后自动补回——hook 捕获 `offlineActivation` 的 IPC handler，在启动后 300ms 起多次重新提交。
 
 ## 已知限制

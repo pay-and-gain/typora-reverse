@@ -154,14 +154,28 @@ ip.handle = function(ch, fn){ if (String(ch) === "offlineActivation") OFF = fn; 
 
 ### 3.2 写入与校验
 
-```js
-if (bytes.length > LSIZE) throw new Error("超出槽位");
-new vm.Script(newText);                       // 语法自检
-const padded = Buffer.alloc(LSIZE, 0x0a);     // 换行填充，JS 允许尾部空白
-bytes.copy(padded, 0); padded.copy(buf, LOFF);
+**先判断槽位**。原厂 asar 的 `launch.dist.js` 只有 1383 字节，装不下 hook；只有被前人改过的包才有 16220 字节的大槽位。所以必须实现两条路径：
+
+- **槽位够** → 原地覆盖，不动其他文件。
+- **槽位不够** → 解包整个 asar，替换 `launch.dist.js`，重新计算 header 与所有文件偏移后重新打包。
+
+重打包的 header 结构（实测）：
+
+```
+[4][outerLen][headerLen][jsonLen][json][padding]
+  4    4          4         4      jsonLen   0~3
 ```
 
-**判定**：写回后重读该区域，头部是 `"use strict"`，尾部仍含 `require("./atom.compiled.dist.jsc")`。
+其中 `outerLen = headerLen + 4`、`headerLen = jsonLen + 4 + padding`、`padding = (4 - jsonLen % 4) % 4`，数据区紧随其后。逐字节对齐必须严格，否则 Electron 直接读不出来。
+
+另外要补一个 `launch.dist.bak.js`（原始 loader 的副本）进包，hook 靠它绕过自身完整性校验。内容变了之后旧的 `integrity` 哈希必然失配，把该文件的 `integrity` 字段去掉，Electron 会跳过校验。
+
+```js
+if (bytes.length > LSIZE) { /* 走重打包 */ }
+new vm.Script(newText);                       // 语法自检
+```
+
+**判定**：写完后重新解包，文件数不变、`launch.dist.js` 尾部仍含 `require("./atom.compiled.dist.jsc")`、`atom.compiled.dist.jsc` 大小与原始一致（379912）、`launch.dist.bak.js` 存在。四项全过再启动。
 
 > 写入前必须备份 `app.asar`。**注意 PowerShell 的 `-Filter 'app.asar.*'` 会把 `app.asar` 本体也匹配进去**，清理备份时用精确路径，不要用通配。
 
