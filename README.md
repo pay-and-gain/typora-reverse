@@ -38,9 +38,10 @@ Releases 里的 `Typora-1.13.7-portable.zip` 是开箱即用的便携包：解�
 |---|---|
 | `docs/REVERSE_HANDBOOK.md` | 完整逆向手册：偏移、常量、时序、排错对照表 |
 | `docs/AI-TASK.md` | 可直接整份交给 AI 独立执行的分阶段任务书 |
-| `tools/patch_asar.js` | 改写 `app.asar`，单机手工激活（换公钥 + 绕过自检） |
+| `tools/patch_asar.js` | 改写 `app.asar`，单机手工激活（只换公钥，私钥不进门） |
 | `tools/gen_license.js` | 生成单机激活码，含公钥一致性检查与回环验证 |
 | `tools/pack_dist.js` | 产出可分发包，任意机器启动自动激活（内嵌私钥） |
+| `tools/lib/asar.js` | asar 读写核心：解包、重打包、原地覆盖槽位 |
 | `tools/probes/probe_layout.js` | 解析 asar 文件表、反推数据区起点、校验槽位 |
 | `tools/probes/probe_bundle.js` | 从单行 minified bundle 中按关键词切出上下文 |
 | `tools/probes/probe_strings.js` | 从 `.jsc` 字节码常量池中提取可打印字符串 |
@@ -60,7 +61,9 @@ node tools/patch_asar.js <样本根目录>
 node tools/gen_license.js <样本根目录>
 ```
 
-样本根目录下应包含 `Typora/resources/app.asar`、`private.pem`、`public.pem`。
+样本根目录下应包含 `Typora/resources/app.asar`、`private.pem`、`public.pem`。`patch_asar.js` 只用到 `public.pem`，另外两个脚本会用到私钥。
+
+脚本会自动判断 `launch.dist.js` 的槽位是否够用：够就原地覆盖，不够就重打包整个 asar。**原厂包必然走重打包**，因为它的槽位只有 1383 字节。
 
 手工激活时注意 UI 入口：**不是**主界面的「序列号」框（那走联网校验），而是点「离线激活」后的 `Activation Token` 输入框，内容格式为 `+<base64>#`——首尾各一个字符会被 `substr(1, len-2)` 裁掉，末尾的 `#` 是必需的，否则 base64 的 `=` 会被吃掉。
 

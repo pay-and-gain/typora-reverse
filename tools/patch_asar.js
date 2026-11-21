@@ -1,101 +1,64 @@
 #!/usr/bin/env node
 "use strict";
 /**
- * 改写 Typora app.asar 内的 launch.dist.js（换公钥 + 绕过完整性自检 + 自动激活）。
+ * 改写 Typora app.asar 内的 launch.dist.js：替换内置公钥 + 绕过完整性自检。
  *
- * 用法: node tools/patch_asar.js <样本根目录> [--repack]
- * 根目录下需有: Typora/resources/app.asar, private.pem, public.pem
+ * 用法: node tools/patch_asar.js <样本根目录> [--repack] [--force]
+ * 根目录下需有: Typora/resources/app.asar, public.pem
+ *
+ * 本脚本只换公钥，不内嵌私钥、不做自动注入。激活请在 Typora 里手工粘贴
+ * 「离线激活」页的 Activation Token（用 tools/gen_license.js 生成）。
+ * 需要「任意机器启动即自动激活」的分发包，请用 tools/pack_dist.js。
  *
  * 两种写入策略，自动选择：
- *   1. 槽位够大 → 原地覆盖（保守，不动其他文件）
- *   2. 槽位不够 → 整个 asar 解包后重打包（原厂 asar 的 launch.dist.js 只有 1383 字节，
- *      装不下 hook，必须走这条）
+ *   1. 槽位够大 -> 原地覆盖（保守，不动其他文件）
+ *   2. 槽位不够 -> 解包整个 asar 后重打包（原厂 asar 的 launch.dist.js 只有
+ *      1383 字节，装不下 hook，必须走这条）
  *
  * 原理见 docs/REVERSE_HANDBOOK.md
  */
 const fs = require("fs");
 const vm = require("vm");
 const path = require("path");
+const { readAsar, pack, overwriteSlot } = require("./lib/asar");
 
 const ROOT = process.argv[2];
 if (!ROOT) {
-  console.error("用法: node tools/patch_asar.js <样本根目录> [--repack]");
+  console.error("用法: node tools/patch_asar.js <样本根目录> [--repack] [--force]");
   process.exit(1);
 }
 
 const ASAR = path.join(ROOT, "Typora", "resources", "app.asar");
-const PRIV = fs.readFileSync(path.join(ROOT, "private.pem"), "utf8").trim();
 const PUB = fs.readFileSync(path.join(ROOT, "public.pem"), "utf8").trim();
 
+const EXPECTED_VERSION = "1.13.7";
 const INTEG_EXPECTED =
   "pvyXdYxWo0HsOVIEo4RFsMiWAmuDpJZ4TZeO0g9ecBchHm86UjJZZftJ2QWkuqlFKPWNbI8lkusRKlRT9SPun07e9mhQ1lZeiojs";
 const INTEG_HEAD = [168, 163, 144, 221, 123, 254, 219, 133, 103, 114, 95, 163, 156, 84, 26, 17];
 
-/* ---------------- asar 读写 ---------------- */
-
-/** 头部结构: [4][outerLen][headerLen][jsonLen][json][padding] */
-function unpack(buf) {
-  const jsonLen = buf.readUInt32LE(12);
-  const pad = (4 - (jsonLen % 4)) % 4;
-  const dataStart = 16 + jsonLen + pad;
-  const header = JSON.parse(buf.subarray(16, 16 + jsonLen).toString("utf8"));
-
-  const files = new Map();
-  (function walk(node, prefix) {
-    for (const [name, meta] of Object.entries(node.files || {})) {
-      const p = prefix ? prefix + "/" + name : name;
-      if (meta.files) {
-        walk(meta, p);
-      } else {
-        const start = dataStart + Number(meta.offset);
-        files.set(p, {
-          data: Buffer.from(buf.subarray(start, start + meta.size)),
-          integrity: meta.integrity,
-        });
-      }
-    }
-  })(header, "");
-
-  return { files, dataStart, total: buf.length };
-}
-
-function pack(files) {
-  let offset = 0;
-  const headerFiles = {};
-  const chunks = [];
-  for (const [name, f] of files) {
-    const entry = { size: f.data.length, offset: String(offset) };
-    if (f.integrity) entry.integrity = f.integrity;
-    headerFiles[name] = entry;
-    chunks.push(f.data);
-    offset += f.data.length;
+function assertVersion() {
+  let ver = null;
+  try {
+    ver = JSON.parse(
+      fs.readFileSync(path.join(ROOT, "Typora", "resources", "package.json"), "utf8")
+    ).version;
+  } catch (e) {
+    /* 读不到按未知处理 */
   }
-
-  const jsonBuf = Buffer.from(JSON.stringify({ files: headerFiles }), "utf8");
-  const pad = (4 - (jsonBuf.length % 4)) % 4;
-
-  const headerBuf = Buffer.alloc(4 + jsonBuf.length + pad);
-  headerBuf.writeUInt32LE(jsonBuf.length, 0);
-  jsonBuf.copy(headerBuf, 4);
-
-  const outer = Buffer.alloc(4 + headerBuf.length);
-  outer.writeUInt32LE(headerBuf.length, 0);
-  headerBuf.copy(outer, 4);
-
-  const sizeBuf = Buffer.alloc(8);
-  sizeBuf.writeUInt32LE(4, 0);
-  sizeBuf.writeUInt32LE(outer.length, 4);
-
-  return Buffer.concat([sizeBuf, outer, ...chunks]);
+  console.log("样本版本:", ver || "(未知)");
+  if (ver === EXPECTED_VERSION) return;
+  console.warn("[!] 本脚本的 INTEG_* 常量与 loader 锚点仅在 " + EXPECTED_VERSION + " 上验证过。");
+  console.warn("    版本不同时偏移、常量、时序都可能失效，产生的包可能无法启动。");
+  if (!process.argv.includes("--force")) {
+    console.error("    确认要在该版本上继续，请追加 --force");
+    process.exit(3);
+  }
 }
-
-/* ---------------- hook ---------------- */
+assertVersion();
 
 const HOOK = `
 (function(){
-var crypto=require("crypto"),cp=require("child_process");
-var lp=path.join(path.dirname(process.execPath),"hook.log");
-function L(){var a=[].slice.call(arguments).map(function(x){try{return typeof x==="string"?x:JSON.stringify(x)}catch(e){return String(x)}});try{fs.appendFileSync(lp,"["+new Date().toISOString()+"] [h] "+a.join(" ")+"\\n")}catch(e){}}
+var crypto=require("crypto");
 var RB=fs.readFileSync.bind(fs);
 var BAK=RB(path.join(__dirname,"launch.dist.bak.js"));
 function isLd(p){return p!=null&&path.basename(String(p)).toLowerCase()==="launch.dist.js"}
@@ -106,7 +69,6 @@ if(typeof m.readFile==="function"){var o2=m.readFile.bind(m);m.readFile=function
 if(m.promises&&typeof m.promises.readFile==="function"){var o3=m.promises.readFile.bind(m.promises);m.promises.readFile=function(f,op){if(isLd(f))return Promise.resolve(bakRes(op));return o3(f,op)}}}
 patchFs(fs);
 try{patchFs(require("original-fs"))}catch(e){}
-var PRIV=${JSON.stringify(PRIV)};
 var PUB=${JSON.stringify(PUB)};
 var IE=Buffer.from(${JSON.stringify(INTEG_EXPECTED)},"utf8");
 var IH=Buffer.from(${JSON.stringify(INTEG_HEAD)});
@@ -120,44 +82,18 @@ return r};
 var BE=Buffer.prototype.equals;
 var isIE=function(b){return Buffer.isBuffer(b)&&b.length===IE.length&&b.toString("latin1")===IE.toString("latin1")};
 Buffer.prototype.equals=function(o){try{if(isIE(this)||isIE(o))return true}catch(e){}return BE.call(this,o)};
-function machineGuid(){
-try{var out=cp.execSync('reg query "HKLM\\\\SOFTWARE\\\\Microsoft\\\\Cryptography" /v MachineGuid',{encoding:"utf8",windowsHide:true});var m=out.match(/MachineGuid\\s+REG_SZ\\s+(\\S+)/i);if(m)return m[1].trim()}catch(e){L("guid fail",e.message)}
-return null}
-function buildToken(){
-var guid=machineGuid();if(!guid)return null;
-var fp=crypto.createHash("sha256").update(guid).update("typora").digest("base64").slice(0,10).replace(/[/=+-]/g,"a");
-var ver="1.13.7";try{ver=require("./package.json").version||ver}catch(e){}
-var payload=JSON.stringify({email:"typora@local",license:"W4Z8D5-PARZG2-7SLDF9-8QMJ9V",fingerprint:fp,deviceId:"00000000-0000-0000-0000-000000000000",version:ver,date:new Date().toLocaleDateString("en-US")});
-var b=Buffer.from(payload,"utf8");if(b.length>245){L("payload too long",b.length);return null}
-try{return crypto.privateEncrypt({key:PRIV,padding:crypto.constants.RSA_PKCS1_PADDING},b).toString("base64")}catch(e){L("sign fail",e.message);return null}}
-var OFF=null;
-(function(){var el;try{el=require("electron")}catch(e){return}var ip=el.ipcMain;if(!ip||ip.__hk||typeof ip.handle!=="function")return;
-var oh=ip.handle.bind(ip);
-ip.handle=function(ch,fn){if(String(ch)==="offlineActivation"){OFF=fn}return oh(ch,fn)};
-ip.__hk=1})();
-function inject(tag){
-if(!OFF)return;
-var el;try{el=require("electron")}catch(e){return}
-var BW=el.BrowserWindow,wc=null;
-if(BW){var ws=BW.getAllWindows().filter(function(w){return !w.isDestroyed()});if(ws.length)wc=ws[0].webContents}
-var tok=buildToken();if(!tok){L("skip "+tag+": no token");return}
-var ev={sender:wc||{send:function(){},isDestroyed:function(){return false}},reply:function(){},senderFrame:null,ports:[]};
-try{Promise.resolve(OFF(ev,tok)).then(function(r){L("activate "+tag+" ->",JSON.stringify(r))}).catch(function(e){L("activate "+tag+" err",e&&e.message)})}catch(e){L("activate "+tag+" throw",e&&e.message)}}
-[300,700,1200,2000,3500,6000,10000].forEach(function(t){setTimeout(function(){inject("t"+t)},t)});
 })();
 `;
 
-/* ---------------- 主流程 ---------------- */
-
 const buf0 = fs.readFileSync(ASAR);
-const { files } = unpack(buf0);
+const { files } = readAsar(ASAR);
+console.log("asar 文件数:", files.size, " 大小:", buf0.length);
 
-// 原始 loader：改过的包里有独立备份，原厂包里 launch.dist.js 本身就是原始 loader
 const ANCHOR = 'v8.setFlagsFromString("--no-lazy")';
 let loaderName = null;
-for (const [name, f] of files) {
+for (const name of files.keys()) {
   if (!/launch\.dist\.(bak\.js|js)$/.test(name)) continue;
-  if (f.data.toString("utf8").includes(ANCHOR)) {
+  if (files.get(name).data.toString("utf8").includes(ANCHOR)) {
     loaderName = name;
     break;
   }
@@ -176,46 +112,38 @@ if (!current) throw new Error("asar 内没有 launch.dist.js");
 const slot = current.data.length;
 console.log("原槽位:", slot, "bytes");
 
-const forceRepack = process.argv.includes("--repack");
-const useRepack = forceRepack || bytes.length > slot;
+const useRepack = process.argv.includes("--repack") || bytes.length > slot;
 console.log("写入策略:", useRepack ? "重打包整个 asar" : "原地覆盖槽位");
 
-// 原始 loader 需要作为备份留在包内（hook 靠它绕过自检）
 if (!files.has("launch.dist.bak.js")) {
   files.set("launch.dist.bak.js", { data: Buffer.from(loaderText, "utf8") });
   console.log("补充 launch.dist.bak.js（原始 loader 备份）");
 }
 
-// 内容变了，旧的 integrity 哈希必然失配；去掉该字段让 Electron 跳过校验
 files.set("launch.dist.js", { data: bytes });
 
 const backup = ASAR + ".orig";
-if (!fs.existsSync(backup)) fs.copyFileSync(ASAR, backup);
-
-let out;
 if (useRepack) {
-  out = pack(files);
+  const out = pack(files);
+  if (!fs.existsSync(backup)) fs.copyFileSync(ASAR, backup);
+  fs.writeFileSync(ASAR, out);
+  console.log("重打包后大小:", out.length);
 } else {
-  out = Buffer.from(buf0);
-  // 原地覆盖时需要按原 offset 定位
-  const jsonLen = buf0.readUInt32LE(12);
-  const pad = (4 - (jsonLen % 4)) % 4;
-  const dataStart = 16 + jsonLen + pad;
-  const json = JSON.parse(buf0.subarray(16, 16 + jsonLen).toString("utf8"));
-  const off = dataStart + Number(json.files["launch.dist.js"].offset);
-  const padded = Buffer.alloc(slot, 0x0a);
-  bytes.copy(padded, 0);
-  padded.copy(out, off);
+  const out = Buffer.from(buf0);
+  overwriteSlot(out, "launch.dist.js", bytes);
+  if (!fs.existsSync(backup)) fs.copyFileSync(ASAR, backup);
+  fs.writeFileSync(ASAR, out);
 }
 
-fs.writeFileSync(ASAR, out);
-
-// 自检：重新解包，确认结构与内容
-const verify = unpack(fs.readFileSync(ASAR));
+const verify = readAsar(ASAR);
 const ld = verify.files.get("launch.dist.js");
 const okMain = ld && ld.data.toString("utf8").includes('require("./atom.compiled.dist.jsc")');
 const okBak = verify.files.has("launch.dist.bak.js");
 const jsc = verify.files.get("atom.compiled.dist.jsc");
-console.log("自检 文件数:", verify.files.size, "| loader 尾部:", okMain, "| bak 存在:", okBak, "| jsc 完整:", !!jsc && jsc.data.length === 379912);
-console.log("asar 大小:", out.length, "原:", buf0.length);
-console.log("备份:", backup);
+console.log(
+  "自检 文件数:", verify.files.size,
+  "| loader 尾部:", okMain,
+  "| bak 存在:", okBak,
+  "| jsc 完整:", !!jsc && jsc.data.length === 379912
+);
+console.log("asar 大小:", fs.statSync(ASAR).size, " 原:", buf0.length);

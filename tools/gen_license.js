@@ -28,18 +28,25 @@ const der = (pem) =>
   crypto.createPublicKey(pem).export({ format: "der", type: "spki" }).toString("hex");
 
 // 校验 asar 内嵌公钥确实已被替换
+// 注意：hook 里的 PEM 是经 JSON.stringify 注入的，换行会变成字面量 "\n"（两个字符），
+// 直接喂给 createPublicKey 会解析失败，必须先反转义再比对。
 const asar = fs.readFileSync(path.join(ROOT, "Typora", "resources", "app.asar"));
 const embedded = [
   ...asar
     .toString("latin1")
     .matchAll(/-----BEGIN PUBLIC KEY-----[\s\S]{200,1200}?-----END PUBLIC KEY-----/g),
 ].map((m) => m[0]);
+
+const normalizePem = (s) => (s.includes("\\n") ? s.replace(/\\n/g, "\n") : s);
 const matched = embedded.filter((k) => {
-  try {
-    return der(k) === der(pubPem);
-  } catch {
-    return false;
+  for (const cand of [k, normalizePem(k)]) {
+    try {
+      if (der(cand) === der(pubPem)) return true;
+    } catch {
+      /* 解析失败就试下一种形式 */
+    }
   }
+  return false;
 });
 console.log("[1] asar 内公钥块:", embedded.length, " 匹配自己的:", matched.length);
 if (matched.length === 0) {
@@ -62,12 +69,22 @@ const fp = crypto
 console.log("[2] MachineGuid:", guid);
 console.log("[2] fingerprint:", fp);
 
+// 版本从样本自身读取，避免换版本后 payload 写错
+let version = "1.13.7";
+try {
+  version = JSON.parse(
+    fs.readFileSync(path.join(ROOT, "Typora", "resources", "package.json"), "utf8")
+  ).version || version;
+} catch {
+  /* 读不到就用默认值 */
+}
+
 const payload = JSON.stringify({
   email: "typora@local",
   license: "W4Z8D5-PARZG2-7SLDF9-8QMJ9V",
   fingerprint: fp,
   deviceId: "00000000-0000-0000-0000-000000000000",
-  version: "1.13.7",
+  version,
   date: new Date().toLocaleDateString("en-US"),
 });
 const plain = Buffer.from(payload, "utf8");

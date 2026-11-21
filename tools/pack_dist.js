@@ -1,22 +1,26 @@
 #!/usr/bin/env node
 "use strict";
 /**
- * 把「运行时签名」能力的 hook 植入 app.asar，产出可分发包。
+ * 生成「任意机器启动即自动激活」的分发包改写版。
  *
- * 用法: node tools/pack_dist.js <样本根目录>
+ * 用法: node tools/pack_dist.js <样本根目录> [--force]
  * 根目录下需有: Typora/resources/app.asar, private.pem, public.pem
  *
- * 与 patch_asar.js 的区别：本脚本生成的 hook 每次启动读取本机 MachineGuid、
- * 现签一份授权再注入，因此同一个包在任何机器上都能自动激活。
- * 代价是私钥随包分发，接收者可提取后签发任意授权。
+ * 与 patch_asar.js 的区别：
+ *   patch_asar.js  只换公钥，私钥不进门，激活码由使用者自己粘贴
+ *   pack_dist.js   内嵌私钥，每次启动读取本机 MachineGuid、现签授权再注入
+ *                  换来的便利是「换电脑免配置」，代价是私钥随包分发
+ *
+ * 原理见 docs/REVERSE_HANDBOOK.md
  */
 const fs = require("fs");
 const vm = require("vm");
 const path = require("path");
+const { readAsar, pack, overwriteSlot } = require("./lib/asar");
 
 const ROOT = process.argv[2];
 if (!ROOT) {
-  console.error("用法: node tools/pack_dist.js <样本根目录>");
+  console.error("用法: node tools/pack_dist.js <样本根目录> [--force]");
   process.exit(1);
 }
 
@@ -24,9 +28,28 @@ const ASAR = path.join(ROOT, "Typora", "resources", "app.asar");
 const PRIV = fs.readFileSync(path.join(ROOT, "private.pem"), "utf8").trim();
 const PUB = fs.readFileSync(path.join(ROOT, "public.pem"), "utf8").trim();
 
+const EXPECTED_VERSION = "1.13.7";
 const INTEG_EXPECTED =
   "pvyXdYxWo0HsOVIEo4RFsMiWAmuDpJZ4TZeO0g9ecBchHm86UjJZZftJ2QWkuqlFKPWNbI8lkusRKlRT9SPun07e9mhQ1lZeiojs";
 const INTEG_HEAD = [168, 163, 144, 221, 123, 254, 219, 133, 103, 114, 95, 163, 156, 84, 26, 17];
+
+(function assertVersion() {
+  let ver = null;
+  try {
+    ver = JSON.parse(
+      fs.readFileSync(path.join(ROOT, "Typora", "resources", "package.json"), "utf8")
+    ).version;
+  } catch (e) {
+    /* 读不到按未知处理 */
+  }
+  console.log("样本版本:", ver || "(未知)");
+  if (ver === EXPECTED_VERSION) return;
+  console.warn("[!] INTEG_* 常量与 loader 锚点仅在 " + EXPECTED_VERSION + " 上验证过。");
+  if (!process.argv.includes("--force")) {
+    console.error("    确认要继续请追加 --force");
+    process.exit(3);
+  }
+})();
 
 const HOOK = `
 (function(){
@@ -84,44 +107,64 @@ try{Promise.resolve(OFF(ev,tok)).then(function(r){L("activate "+tag+" ->",JSON.s
 })();
 `;
 
-function readEntry(buf, name) {
-  const head = buf.subarray(0, 8192).toString("latin1");
-  let sum = 0;
-  for (const m of head.matchAll(/"size":(\d+)/g)) sum += Number(m[1]);
-  const dataStart = buf.length - sum;
-  const re = new RegExp(
-    '"' + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '":\\{"size":(\\d+),"offset":"?(\\d+)"?'
-  );
-  const m = head.match(re);
-  if (!m) throw new Error("asar 内未找到条目: " + name);
-  const size = Number(m[1]);
-  return { data: buf.subarray(dataStart + Number(m[2]), dataStart + Number(m[2]) + size), size, off: dataStart + Number(m[2]) };
+const buf0 = fs.readFileSync(ASAR);
+const { files } = readAsar(ASAR);
+console.log("asar 文件数:", files.size, " 大小:", buf0.length);
+
+const ANCHOR = 'v8.setFlagsFromString("--no-lazy")';
+let loaderName = null;
+for (const name of files.keys()) {
+  if (!/launch\.dist\.(bak\.js|js)$/.test(name)) continue;
+  if (files.get(name).data.toString("utf8").includes(ANCHOR)) {
+    loaderName = name;
+    break;
+  }
+}
+if (!loaderName) throw new Error("asar 内未找到含 v8 flags 的原始 loader");
+const loaderText = files.get(loaderName).data.toString("utf8");
+console.log("loader 来源:", loaderName, "(" + loaderText.length + " bytes)");
+
+const newText = loaderText.replace(ANCHOR, HOOK.trim() + ";" + ANCHOR);
+const bytes = Buffer.from(newText, "utf8");
+new vm.Script(newText);
+console.log("新 launch.dist.js:", bytes.length, "bytes, syntax PASS");
+
+const current = files.get("launch.dist.js");
+if (!current) throw new Error("asar 内没有 launch.dist.js");
+const slot = current.data.length;
+console.log("原槽位:", slot, "bytes");
+
+const useRepack = bytes.length > slot;
+console.log("写入策略:", useRepack ? "重打包整个 asar" : "原地覆盖槽位");
+
+if (!files.has("launch.dist.bak.js")) {
+  files.set("launch.dist.bak.js", { data: Buffer.from(loaderText, "utf8") });
+  console.log("补充 launch.dist.bak.js（原始 loader 备份）");
 }
 
-const buf0 = fs.readFileSync(ASAR);
-const bak = readEntry(buf0, "launch.dist.bak.js");
-const ld = readEntry(buf0, "launch.dist.js");
-console.log("bak:", bak.size, "@", bak.off, " ld:", ld.size, "@", ld.off);
+files.set("launch.dist.js", { data: bytes });
 
-const bakText = bak.data.toString("utf8");
-const ANCHOR = 'v8.setFlagsFromString("--no-lazy")';
-if (!bakText.includes(ANCHOR)) throw new Error("原始 loader 中未找到锚点");
+const backup = ASAR + ".orig";
+if (useRepack) {
+  const out = pack(files);
+  if (!fs.existsSync(backup)) fs.copyFileSync(ASAR, backup);
+  fs.writeFileSync(ASAR, out);
+  console.log("重打包后大小:", out.length);
+} else {
+  const out = Buffer.from(buf0);
+  overwriteSlot(out, "launch.dist.js", bytes);
+  if (!fs.existsSync(backup)) fs.copyFileSync(ASAR, backup);
+  fs.writeFileSync(ASAR, out);
+}
 
-const newText = bakText.replace(ANCHOR, HOOK.trim() + ";" + ANCHOR);
-const bytes = Buffer.from(newText, "utf8");
-console.log("new:", bytes.length, "/", ld.size);
-if (bytes.length > ld.size) throw new Error("超出槽位");
-
-new vm.Script(newText);
-console.log("syntax: PASS");
-
-const buf = Buffer.from(buf0);
-const padded = Buffer.alloc(ld.size, 0x0a);
-bytes.copy(padded, 0);
-padded.copy(buf, ld.off);
-
-if (!fs.existsSync(ASAR + ".orig")) fs.copyFileSync(ASAR, ASAR + ".orig");
-fs.writeFileSync(ASAR, buf);
-
-const check = fs.readFileSync(ASAR).subarray(ld.off, ld.off + ld.size).toString("utf8");
-console.log("written:", check.includes('require("./atom.compiled.dist.jsc")') ? "PASS" : "FAIL");
+const verify = readAsar(ASAR);
+const ld = verify.files.get("launch.dist.js");
+const okMain = ld && ld.data.toString("utf8").includes('require("./atom.compiled.dist.jsc")');
+const jsc = verify.files.get("atom.compiled.dist.jsc");
+console.log(
+  "自检 文件数:", verify.files.size,
+  "| loader 尾部:", okMain,
+  "| bak 存在:", verify.files.has("launch.dist.bak.js"),
+  "| jsc 完整:", !!jsc && jsc.data.length === 379912
+);
+console.log("asar 大小:", fs.statSync(ASAR).size, " 原:", buf0.length);
