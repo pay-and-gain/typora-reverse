@@ -22,8 +22,11 @@ Releases 里的 `Typora-1.13.7-portable.zip` 是开箱即用的便携包：解�
 
 ```
 docs/REVERSE_HANDBOOK.md   完整逆向手册（偏移、常量、时序、排错表）
-tools/patch_asar.js        改写 app.asar 内 launch.dist.js（换公钥 + 绕过自检 + 自动注入）
-tools/gen_license.js       生成单机激活码（手工粘贴用）
+docs/AI-TASK.md            可直接整份交给 AI 独立执行的分阶段任务书
+tools/patch_asar.js        改写 app.asar（换公钥 + 绕过自检 + 自动注入），单机手工激活
+tools/gen_license.js       生成单机激活码（含公钥一致性检查与回环验证）
+tools/pack_dist.js         生成「运行时签名」版，产出可分发包（任意机器自动激活）
+tools/probes/              侦查脚本：asar 布局解析、bundle 切片、二进制字符串提取
 ```
 
 ## 自行构建
